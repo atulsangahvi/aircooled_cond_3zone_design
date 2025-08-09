@@ -280,7 +280,7 @@ def calculate_effectiveness(NTU, C_star):
     """Calculate effectiveness for crossflow with one fluid mixed"""
     if C_star == 0:  # Phase change
         return 1 - math.exp(-NTU)
-    return (1/C_star) * (1 - math.exp(-C_star * (1 - math.exp(-NTU)))
+    return (1/C_star) * (1 - math.exp(-C_star * (1 - math.exp(-NTU))))
 
 zone_data = [
     ("Subcooling", Q_sub, U_subcool, h_ref_subcool, T3, props_subcool['cp']),
