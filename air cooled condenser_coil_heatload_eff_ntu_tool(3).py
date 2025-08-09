@@ -280,7 +280,12 @@ def calculate_effectiveness(NTU, C_star):
     """Calculate effectiveness for crossflow with one fluid mixed"""
     if C_star == 0:  # Phase change
         return 1 - math.exp(-NTU)
-    return (1/C_star) * (1 - math.exp(-C_star * (1 - math.exp(-NTU))))
+    elif C_star == 1:
+        return NTU / (1 + NTU)
+    else:
+        numerator = 1 - math.exp(-NTU*(1 - C_star))
+        denominator = 1 - C_star*math.exp(-NTU*(1 - C_star))
+        return numerator / denominator
 
 zone_data = [
     ("Subcooling", Q_sub, U_subcool, h_ref_subcool, T3, props_subcool['cp']),
@@ -291,13 +296,14 @@ zone_data = [
 zone_outputs = []
 diagnostics = []
 air_t = air_temp
-cumulative_rows = 0
-remaining_rows = num_rows  # Track remaining rows
+remaining_rows = num_rows
+total_Q_actual = 0
+total_Q_required = Q_sens + Q_lat + Q_sub
 
 for label, Q_zone, U, h_ref, T_ref, cp_zone in zone_data:
     if Q_zone <= 0 or remaining_rows <= 0:
         zone_outputs.append((label, Q_zone, 0, 0, 0, air_t))
-        diagnostics.append((label, 0, 0, 0, 0, 0, 0, 0, 0))
+        diagnostics.append((label, 0, 0, 0, 0, 0, U, A_air_per_m, 0))
         continue
         
     # Capacity rates
@@ -305,73 +311,64 @@ for label, Q_zone, U, h_ref, T_ref, cp_zone in zone_data:
         C_min = C_air
         C_star = 0
         delta_T = max(1, T_ref - air_t)
-        eps = min(0.99, Q_zone / (C_min * delta_T))
-        NTU = -math.log(1 - eps)
     else:
         C_r = m_dot * cp_zone
         C_min = min(C_air, C_r)
         C_max = max(C_air, C_r)
         C_star = C_min / max(0.001, C_max)
         delta_T = max(1, abs(T_ref - air_t))
-        eps = min(0.99, Q_zone / (C_min * delta_T))
+
+    # Calculate maximum possible heat transfer
+    Q_max = C_min * delta_T
+    
+    # Numerically solve for NTU that gives required Q_zone
+    NTU_guess = 1.0
+    try:
+        def equation(NTU):
+            eps = calculate_effectiveness(NTU, C_star)
+            return eps * Q_max - Q_zone
         
-        if C_star == 1:
-            NTU = eps/(1-eps)
-        else:
-            try:
-                NTU = (1/(C_star-1)) * math.log((1-eps)/(1-eps*C_star))
-            except:
-                NTU = 100  # Fallback for numerical issues
-    
+        NTU = max(0.1, min(fsolve(equation, NTU_guess)[0], 100))
+        eps = calculate_effectiveness(NTU, C_star)
+    except:
+        NTU = 3.0  # Fallback value
+        eps = min(0.99, Q_zone / Q_max)
+
     A_required = NTU * C_min * 1000 / max(1, U)
+    tube_length_needed = A_required / max(0.1, A_air_per_m)
+    rows_needed = tube_length_needed / max(0.1, total_tube_length_per_row)
     
-    # Calculate rows needed and available
-    tube_length_needed = A_required / max(1, A_air_per_m)
-    rows_needed = tube_length_needed / max(1, total_tube_length_per_row)
-    rows_used = min(rows_needed, remaining_rows)
+    # Distribute rows proportionally to heat load
+    rows_used = min(rows_needed, remaining_rows * (Q_zone/total_Q_required))
+    rows_used = min(rows_used, remaining_rows)
+    remaining_rows -= rows_used
     
     # Calculate actual heat transfer
-    tube_length_used = rows_used * total_tube_length_per_row
-    A_used = tube_length_used * A_air_per_m
-    Q_actual = eps * C_min * delta_T if rows_used >= rows_needed else U * A_used * delta_T / 1000
-    air_out = air_t + (Q_actual/max(0.001, C_air))
+    A_used = rows_used * total_tube_length_per_row * A_air_per_m
+    Q_actual = eps * Q_max if rows_used >= rows_needed else U * A_used * delta_T / 1000
+    total_Q_actual += Q_actual
+    
+    # Update air temperature (with physical limits)
+    air_out = min(85, max(air_temp, air_t + (Q_actual/max(0.001, C_air))))
     
     zone_outputs.append((label, Q_zone, A_required, rows_needed, rows_used, air_out))
     diagnostics.append((label, C_min, C_star, delta_T, eps, NTU, U, A_air_per_m, Q_actual))
     
     air_t = air_out
-    cumulative_rows += rows_used
-    remaining_rows -= rows_used
 
-# Add proportional distribution if no rows left
-if remaining_rows > 0 and sum([z[1] for z in zone_outputs]) > 0:
-    total_q = sum([z[1] for z in zone_outputs])
-    new_outputs = []
-    for zone in zone_outputs:
-        if zone[1] > 0:  # If zone has heat load
-            additional_rows = remaining_rows * (zone[1]/total_q)
-            new_rows_used = zone[4] + additional_rows
-            # Recalculate actual heat transfer with new rows
-            new_tube_length = new_rows_used * total_tube_length_per_row
-            new_A_used = new_tube_length * A_air_per_m
-            new_Q_actual = zone[5] * new_rows_used/zone[4] if zone[4] > 0 else 0
-            new_outputs.append((zone[0], zone[1], zone[2], zone[3], new_rows_used, new_Q_actual))
-        else:
-            new_outputs.append(zone)
-    zone_outputs = new_outputs
-    remaining_rows = 0
+# Final verification
+if abs(total_Q_actual - total_Q_required) > 1:
+    st.warning(f"Heat balance mismatch: {total_Q_actual:.2f} kW vs {total_Q_required:.2f} kW")
 
 # ====================== OUTPUT SECTION ======================
 st.header("📋 Design Results")
 
 # Main summary
 cols = st.columns(4)
-cols[0].metric("Total Heat Load", f"{Q_sens + Q_lat + Q_sub:.2f} kW")
-cols[1].metric("Required Area", f"{sum([z[2] for z in zone_outputs]):.2f} m²", 
-               delta=f"{sum([z[2] for z in zone_outputs])-A_air_total:.2f} vs provided")
-cols[2].metric("Rows Utilization", f"{cumulative_rows:.2f}/{num_rows}",
-              delta=f"{(cumulative_rows/num_rows*100):.1f}% used")
-cols[3].metric("Air Out Temp", f"{air_t:.1f} °C")
+cols[0].metric("Total Heat Load", f"{total_Q_required:.2f} kW")
+cols[1].metric("Actual Heat Transfer", f"{total_Q_actual:.2f} kW")
+cols[2].metric("Rows Utilization", f"{num_rows - remaining_rows:.2f}/{num_rows}")
+cols[3].metric("Max Air Out Temp", f"{air_t:.1f} °C")
 
 # Detailed results
 st.subheader("🔍 Zone-by-Zone Results")
@@ -383,12 +380,29 @@ st.dataframe(df.style.format({
     "Area Needed (m²)": "{:.2f}",
     "Rows Needed": "{:.2f}",
     "Rows Used": "{:.2f}",
-    "Air Out Temp (°C)": "{:.2f}"
+    "Air Out Temp (°C)": "{:.1f}"
+}))
+
+# Diagnostic data
+st.subheader("🛠️ Diagnostic Parameters")
+diag_df = pd.DataFrame(diagnostics, columns=[
+    "Zone", "C_min (kW/K)", "C*", "ΔT (°C)", "ε", "NTU", "U (W/m²K)", 
+    "Area/m (m²/m)", "Q_actual (kW)"
+])
+st.dataframe(diag_df.style.format({
+    "C_min (kW/K)": "{:.3f}",
+    "C*": "{:.3f}",
+    "ΔT (°C)": "{:.1f}",
+    "ε": "{:.3f}",
+    "NTU": "{:.2f}",
+    "U (W/m²K)": "{:.1f}",
+    "Area/m (m²/m)": "{:.2f}",
+    "Q_actual (kW)": "{:.2f}"
 }))
 
 # Design verification
-if cumulative_rows > num_rows * 1.01:
-    st.error(f"⚠️ Requires {cumulative_rows:.2f} rows but only {num_rows} provided")
+if (num_rows - remaining_rows) > num_rows * 1.01:
+    st.error(f"⚠️ Requires {num_rows - remaining_rows:.2f} rows but only {num_rows} provided")
     st.warning(f"""
     **Recommendations:**
     - Increase number of rows (current: {num_rows})
@@ -403,10 +417,7 @@ else:
 
 # Download buttons
 csv1 = df.to_csv(index=False)
-csv2 = pd.DataFrame(diagnostics, columns=[
-    "Zone", "C_min (kW/K)", "C*", "ΔT (°C)", "ε", "NTU", "U (W/m²K)", 
-    "Area/m (m²/m)", "Q_actual (kW)"
-]).to_csv(index=False)
+csv2 = diag_df.to_csv(index=False)
 
 cols = st.columns(2)
 cols[0].download_button(
